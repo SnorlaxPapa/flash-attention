@@ -31,6 +31,42 @@ def _attn_fwd_inner(
     else:
         lo, hi = 0, SEQ_LEN
 
+    for start_kv in range (lo, hi, BLOCK_SIZE_KV):
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+
+        K_block = tl.load(K_block_ptr)
+        QK_block = tl.dot(Q_block, K_block)
+
+        if STAGE == 2:
+            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :])
+            QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e6) 
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            QK_block -= m_ij[:, None]
+
+        else:
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_scale)
+            QK_block = QK_block * softmax_scale - m_ij[:, None]
+        
+        P_block = tl.math.exp(QK_block)
+        l_ij = tl.sum(P_block, 1)
+
+        alpha = tl.math.exp(m_i - m_ij)
+
+        l_i = l_i * alpha + l_ij
+
+        V_block = tl.load(V_block_ptr)
+        P_block = P_block.to(tl.float16)
+
+        O_block = O_block * alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block)
+
+        m_i = m_ij
+
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV)) #remember k is transposed!
+
+    return O_block, l_i, m_i
+
 
 @triton.jit
 def _attn_fwd(
@@ -168,6 +204,14 @@ def _attn_fwd(
             offs_kv,
             SEQ_LEN,
         )
+
+    m_i += tl.math.log(l_i) #we can just save m_i + l_i because when you resolve this softmax(xi) = exp(xi - (mi+logli)), it cleanly resolves to exp(xi-mi)/li which is our softmax func! makes calculation faster
+    O_block = O_block / l_i[:, None]
+
+    #remember, M is a tracker that tracks our maximum for each of our tokens. so, its shape would be BATCH, NUM_HEADS, SEQ LEN (no dimensions because its 1 per token)
+    m_ptrs = M + index_batch_head * SEQ_LEN + offs_q
+    tl.store(m_ptrs, m_i)
+    tl.store(O_block_ptr, O_block.to(O.type.element_ty))
 
 
 class TritonAttention(torch.autograd.Function):
